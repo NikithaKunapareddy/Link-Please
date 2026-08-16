@@ -99,14 +99,12 @@ async def _process_event(event: dict) -> None:
 
         if send_id is None:
             # Already sent (or sending) for this rule+user pair
+            # The webhook handler already incremented the in-memory counter;
+            # just persist a record to DB for durability.
             logger.debug(
-                "Duplicate blocked: rule=%s user=%s comment=%s",
+                "Duplicate blocked (worker): rule=%s user=%s comment=%s",
                 rule_id, user_id, comment_id,
             )
-            # Record that we blocked this duplicate
-            # We need to update stats — increment a duplicate_blocked counter
-            # We do this by trying to insert with status duplicate_blocked
-            # But since we already have a record for this rule+user, we just track it separately
             await _record_duplicate_blocked(rule_id, user_id, comment_id)
             continue
 

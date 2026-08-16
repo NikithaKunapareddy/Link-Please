@@ -117,6 +117,28 @@ async def receive_webhook(request: Request) -> JSONResponse:
         logger.warning("Webhook received non-JSON body — ignoring")
         return JSONResponse(content={"status": "ok"}, status_code=200)
 
+    # ── Synchronous duplicate-user check (in-memory, lock-protected) ──────────
+    # For comment.created events, check if this user+rule combo was already seen.
+    # check_and_mark_rule_user() uses an asyncio.Lock, so concurrent requests are
+    # safely serialized — no race conditions even with 50 simultaneous webhooks.
+    if payload.get("event_type") == "comment.created":
+        data = payload.get("data", {})
+        comment_text = (data.get("text") or "").upper()
+        user_id = (data.get("from") or {}).get("user_id", "")
+        if comment_text and user_id:
+            rules = await db.get_all_rules()
+            for rule in rules:
+                if rule["keyword"].upper() in comment_text:
+                    is_new = await db.check_and_mark_rule_user(rule["rule_id"], user_id)
+                    if not is_new:
+                        logger.debug(
+                            "Duplicate pre-detected in webhook handler: rule=%s user=%s",
+                            rule["rule_id"], user_id,
+                        )
+                        # Still enqueue so worker can persist the record,
+                        # but break to avoid over-counting multiple matching rules
+                        break
+
     # ── Enqueue for background processing (non-blocking) ────────────────────
     try:
         event_queue.put_nowait(payload)

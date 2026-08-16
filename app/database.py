@@ -22,15 +22,44 @@ logger = logging.getLogger(__name__)
 # We'll set this pool up in main.py via init_db() and it will remain global
 pool: Optional[asyncpg.Pool] = None
 
+# ── In-memory deduplication for (rule_id, user_id) pairs ─────────────────────
+# Protected by an asyncio.Lock so concurrent webhook requests are serialized.
+# Pre-populated from DB on startup so restarts don't forget existing sends.
+_seen_rule_user: set[tuple[str, str]] = set()
+_seen_lock: asyncio.Lock  # initialized in init_db after event loop is running
+_duplicates_blocked_count: int = 0
+
+
+async def check_and_mark_rule_user(rule_id: str, user_id: str) -> bool:
+    """
+    Returns True if this (rule_id, user_id) pair is NEW and should get a DM.
+    Returns False if it's a duplicate — also increments the blocked counter.
+    Uses an asyncio.Lock so concurrent requests are serialized safely.
+    """
+    global _duplicates_blocked_count
+    key = (rule_id, user_id)
+    async with _seen_lock:
+        if key in _seen_rule_user:
+            _duplicates_blocked_count += 1
+            return False
+        _seen_rule_user.add(key)
+        return True
+
+
+def increment_duplicates_blocked() -> None:
+    global _duplicates_blocked_count
+    _duplicates_blocked_count += 1
+
 
 async def init_db() -> asyncpg.Pool:
     """Create all tables if they don't exist and return the pool."""
-    global pool
+    global pool, _seen_lock, _seen_rule_user
+    _seen_lock = asyncio.Lock()
     pool = await asyncpg.create_pool(
         settings.database_url,
         statement_cache_size=0,
     )
-    
+
     async with pool.acquire() as db:
         # Rules table
         await db.execute("""
@@ -76,6 +105,15 @@ async def init_db() -> asyncpg.Pool:
         """)
 
         logger.info("Database initialized at %s", settings.database_url)
+
+        # Pre-populate the in-memory dedup set from existing records
+        rows = await db.fetch(
+            "SELECT rule_id, user_id FROM dm_sends WHERE status != 'duplicate_blocked'"
+        )
+        for row in rows:
+            _seen_rule_user.add((row["rule_id"], row["user_id"]))
+        logger.info("Loaded %d existing rule+user pairs into memory", len(_seen_rule_user))
+
     return pool
 
 
@@ -223,13 +261,12 @@ async def get_stats() -> dict:
         sent = await db.fetchval("SELECT COUNT(*) FROM dm_sends WHERE status = 'delivered'")
         failed = await db.fetchval("SELECT COUNT(*) FROM dm_sends WHERE status = 'failed'")
         queued = await db.fetchval("SELECT COUNT(*) FROM dm_sends WHERE status IN ('queued', 'sent_to_api')")
-        dups = await db.fetchval("SELECT COUNT(*) FROM dm_sends WHERE status = 'duplicate_blocked'")
 
     return {
         "sent": sent,
         "failed": failed,
         "queued": queued,
-        "duplicates_blocked": dups,
+        "duplicates_blocked": _duplicates_blocked_count,
     }
 
 
