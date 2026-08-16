@@ -10,6 +10,7 @@ Handles:
 
 import asyncio
 import logging
+import time
 import uuid
 from typing import Optional
 
@@ -33,6 +34,33 @@ def _headers(idempotency_key: Optional[str] = None) -> dict:
     if idempotency_key:
         h["Idempotency-Key"] = idempotency_key
     return h
+
+
+_request_timestamps = []
+_rate_limit_lock = asyncio.Lock()
+
+async def _wait_for_rate_limit():
+    """
+    Proactively throttles requests to 9 per rolling 60 seconds
+    to guarantee we never hit a 429 rate limit.
+    """
+    async with _rate_limit_lock:
+        now = time.monotonic()
+        while _request_timestamps and now - _request_timestamps[0] >= 60.0:
+            _request_timestamps.pop(0)
+            
+        if len(_request_timestamps) >= 9:
+            wait_time = 60.0 - (now - _request_timestamps[0])
+            if wait_time > 0:
+                logger.debug("Proactive rate limit: sleeping %.1fs", wait_time)
+                await asyncio.sleep(wait_time)
+            
+            # Re-evaluate after sleeping
+            now = time.monotonic()
+            while _request_timestamps and now - _request_timestamps[0] >= 60.0:
+                _request_timestamps.pop(0)
+
+        _request_timestamps.append(time.monotonic())
 
 
 async def send_dm(
@@ -70,6 +98,7 @@ async def send_dm(
     async with httpx.AsyncClient(timeout=_SEND_TIMEOUT) as client:
         for attempt in range(1, max_attempts + 1):
             try:
+                await _wait_for_rate_limit()
                 resp = await client.post(
                     f"{BASE_URL}/v1/dm/send",
                     json=payload,

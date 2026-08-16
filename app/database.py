@@ -1,5 +1,5 @@
 """
-database.py — SQLite persistence layer using aiosqlite.
+database.py — PostgreSQL persistence layer using asyncpg.
 
 Tables:
   rules            — keyword→message rules
@@ -13,28 +13,32 @@ import logging
 import uuid
 from typing import Optional
 
-import aiosqlite
+import asyncpg
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-_db_path = settings.database_path
+# We'll set this pool up in main.py via init_db() and it will remain global
+pool: Optional[asyncpg.Pool] = None
 
 
-async def init_db() -> None:
-    """Create all tables if they don't exist."""
-    async with aiosqlite.connect(_db_path) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("PRAGMA foreign_keys=ON")
-
+async def init_db() -> asyncpg.Pool:
+    """Create all tables if they don't exist and return the pool."""
+    global pool
+    pool = await asyncpg.create_pool(
+        settings.database_url,
+        statement_cache_size=0,
+    )
+    
+    async with pool.acquire() as db:
         # Rules table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS rules (
                 rule_id     TEXT PRIMARY KEY,
                 keyword     TEXT NOT NULL,
                 dm_message  TEXT NOT NULL,
-                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -42,7 +46,7 @@ async def init_db() -> None:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS processed_events (
                 event_id   TEXT PRIMARY KEY,
-                processed_at TEXT NOT NULL DEFAULT (datetime('now'))
+                processed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -57,8 +61,8 @@ async def init_db() -> None:
                 status          TEXT NOT NULL DEFAULT 'queued',
                 retries         INTEGER NOT NULL DEFAULT 0,
                 error_detail    TEXT,
-                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(rule_id, user_id)
             )
         """)
@@ -67,32 +71,33 @@ async def init_db() -> None:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS deleted_comments (
                 comment_id  TEXT PRIMARY KEY,
-                deleted_at  TEXT NOT NULL DEFAULT (datetime('now'))
+                deleted_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
-        await db.commit()
-        logger.info("Database initialized at %s", _db_path)
+        logger.info("Database initialized at %s", settings.database_url)
+    return pool
 
+
+async def close_db() -> None:
+    if pool:
+        await pool.close()
 
 # ─── Rules ───────────────────────────────────────────────────────────────────
 
 async def create_rule(keyword: str, dm_message: str) -> dict:
     rule_id = f"rule_{uuid.uuid4().hex[:12]}"
-    async with aiosqlite.connect(_db_path) as db:
+    async with pool.acquire() as db:
         await db.execute(
-            "INSERT INTO rules (rule_id, keyword, dm_message) VALUES (?, ?, ?)",
-            (rule_id, keyword.upper(), dm_message),
+            "INSERT INTO rules (rule_id, keyword, dm_message) VALUES ($1, $2, $3)",
+            rule_id, keyword.upper(), dm_message,
         )
-        await db.commit()
     return {"rule_id": rule_id, "keyword": keyword, "dm_message": dm_message}
 
 
 async def get_all_rules() -> list[dict]:
-    async with aiosqlite.connect(_db_path) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT rule_id, keyword, dm_message FROM rules")
-        rows = await cursor.fetchall()
+    async with pool.acquire() as db:
+        rows = await db.fetch("SELECT rule_id, keyword, dm_message FROM rules")
     return [dict(r) for r in rows]
 
 
@@ -102,28 +107,25 @@ async def mark_event_processed(event_id: str) -> bool:
     """
     Returns True if the event is NEW (first time seen).
     Returns False if it's a duplicate.
-    Uses INSERT OR IGNORE for atomic check-and-insert.
+    Uses INSERT ON CONFLICT DO NOTHING for atomic check-and-insert.
     """
-    async with aiosqlite.connect(_db_path) as db:
-        cursor = await db.execute(
-            "INSERT OR IGNORE INTO processed_events (event_id) VALUES (?)",
-            (event_id,),
+    async with pool.acquire() as db:
+        result = await db.execute(
+            "INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            event_id,
         )
-        await db.commit()
-        return cursor.rowcount == 1  # 1 = newly inserted, 0 = already existed
+        return result == "INSERT 0 1"
 
 
 # ─── DM send records ─────────────────────────────────────────────────────────
 
 async def get_dm_send(rule_id: str, user_id: str) -> Optional[dict]:
     """Check if we've already sent (or are trying to send) a DM for this rule+user."""
-    async with aiosqlite.connect(_db_path) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM dm_sends WHERE rule_id = ? AND user_id = ?",
-            (rule_id, user_id),
+    async with pool.acquire() as db:
+        row = await db.fetchrow(
+            "SELECT * FROM dm_sends WHERE rule_id = $1 AND user_id = $2",
+            rule_id, user_id,
         )
-        row = await cursor.fetchone()
     return dict(row) if row else None
 
 
@@ -134,23 +136,18 @@ async def create_dm_send(rule_id: str, user_id: str, comment_id: str) -> Optiona
     """
     send_id = f"send_{uuid.uuid4().hex[:12]}"
     try:
-        async with aiosqlite.connect(_db_path) as db:
-            await db.execute(
+        async with pool.acquire() as db:
+            result = await db.execute(
                 """
-                INSERT OR IGNORE INTO dm_sends (id, rule_id, user_id, comment_id, status)
-                VALUES (?, ?, ?, ?, 'queued')
+                INSERT INTO dm_sends (id, rule_id, user_id, comment_id, status)
+                VALUES ($1, $2, $3, $4, 'queued')
+                ON CONFLICT DO NOTHING
                 """,
-                (send_id, rule_id, user_id, comment_id),
+                send_id, rule_id, user_id, comment_id,
             )
-            cursor = await db.execute(
-                "SELECT id FROM dm_sends WHERE rule_id = ? AND user_id = ?",
-                (rule_id, user_id),
-            )
-            row = await cursor.fetchone()
-            await db.commit()
-            if row and row[0] == send_id:
+            if result == "INSERT 0 1":
                 return send_id
-            return None  # Already existed
+            return None
     except Exception as e:
         logger.error("create_dm_send error: %s", e)
         return None
@@ -163,45 +160,42 @@ async def update_dm_status(
     error_detail: Optional[str] = None,
     increment_retries: bool = False,
 ) -> None:
-    async with aiosqlite.connect(_db_path) as db:
+    async with pool.acquire() as db:
         if increment_retries:
             await db.execute(
                 """
                 UPDATE dm_sends
-                SET status = ?, dm_id = ?, error_detail = ?,
+                SET status = $1, dm_id = $2, error_detail = $3,
                     retries = retries + 1,
-                    updated_at = datetime('now')
-                WHERE id = ?
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $4
                 """,
-                (status, dm_id, error_detail, send_id),
+                status, dm_id, error_detail, send_id,
             )
         else:
             await db.execute(
                 """
                 UPDATE dm_sends
-                SET status = ?, dm_id = ?,  error_detail = ?,
-                    updated_at = datetime('now')
-                WHERE id = ?
+                SET status = $1, dm_id = $2,  error_detail = $3,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $4
                 """,
-                (status, dm_id, error_detail, send_id),
+                status, dm_id, error_detail, send_id,
             )
-        await db.commit()
 
 
 async def get_queued_dm_sends(limit: int = 100) -> list[dict]:
     """Get DMs that are queued and haven't exceeded max retries."""
-    async with aiosqlite.connect(_db_path) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
+    async with pool.acquire() as db:
+        rows = await db.fetch(
             """
             SELECT * FROM dm_sends
-            WHERE status = 'queued' AND retries < ?
+            WHERE status = 'queued' AND retries < $1
             ORDER BY created_at ASC
-            LIMIT ?
+            LIMIT $2
             """,
-            (settings.max_retries, limit),
+            settings.max_retries, limit,
         )
-        rows = await cursor.fetchall()
     return [dict(r) for r in rows]
 
 
@@ -210,39 +204,26 @@ async def get_pending_dm_sends_for_reconciliation(limit: int = 100) -> list[dict
     Get DMs where we got a dm_id back from the API (status='sent_to_api')
     but haven't confirmed delivery yet.
     """
-    async with aiosqlite.connect(_db_path) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
+    async with pool.acquire() as db:
+        rows = await db.fetch(
             """
             SELECT * FROM dm_sends
             WHERE status = 'sent_to_api' AND dm_id IS NOT NULL
-            LIMIT ?
+            LIMIT $1
             """,
-            (limit,),
+            limit,
         )
-        rows = await cursor.fetchall()
     return [dict(r) for r in rows]
 
 
 # ─── Stats ────────────────────────────────────────────────────────────────────
 
 async def get_stats() -> dict:
-    async with aiosqlite.connect(_db_path) as db:
-        # sent = DMs confirmed delivered
-        c = await db.execute("SELECT COUNT(*) FROM dm_sends WHERE status = 'delivered'")
-        sent = (await c.fetchone())[0]
-
-        # failed = gave up after retries (status = 'failed')
-        c = await db.execute("SELECT COUNT(*) FROM dm_sends WHERE status = 'failed'")
-        failed = (await c.fetchone())[0]
-
-        # queued = waiting to send or waiting on retry
-        c = await db.execute("SELECT COUNT(*) FROM dm_sends WHERE status IN ('queued', 'sent_to_api')")
-        queued = (await c.fetchone())[0]
-
-        # duplicates_blocked = how many events we matched a rule for but already had a dm_send record
-        c = await db.execute("SELECT COUNT(*) FROM dm_sends WHERE status = 'duplicate_blocked'")
-        dups = (await c.fetchone())[0]
+    async with pool.acquire() as db:
+        sent = await db.fetchval("SELECT COUNT(*) FROM dm_sends WHERE status = 'delivered'")
+        failed = await db.fetchval("SELECT COUNT(*) FROM dm_sends WHERE status = 'failed'")
+        queued = await db.fetchval("SELECT COUNT(*) FROM dm_sends WHERE status IN ('queued', 'sent_to_api')")
+        dups = await db.fetchval("SELECT COUNT(*) FROM dm_sends WHERE status = 'duplicate_blocked'")
 
     return {
         "sent": sent,
@@ -255,33 +236,30 @@ async def get_stats() -> dict:
 # ─── Deleted comments ────────────────────────────────────────────────────────
 
 async def mark_comment_deleted(comment_id: str) -> None:
-    async with aiosqlite.connect(_db_path) as db:
+    async with pool.acquire() as db:
         await db.execute(
-            "INSERT OR IGNORE INTO deleted_comments (comment_id) VALUES (?)",
-            (comment_id,),
+            "INSERT INTO deleted_comments (comment_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            comment_id,
         )
-        await db.commit()
 
 
 async def is_comment_deleted(comment_id: str) -> bool:
-    async with aiosqlite.connect(_db_path) as db:
-        cursor = await db.execute(
-            "SELECT 1 FROM deleted_comments WHERE comment_id = ?",
-            (comment_id,),
+    async with pool.acquire() as db:
+        val = await db.fetchval(
+            "SELECT 1 FROM deleted_comments WHERE comment_id = $1",
+            comment_id,
         )
-        row = await cursor.fetchone()
-    return row is not None
+    return val is not None
 
 
 async def cancel_queued_dm_for_comment(comment_id: str) -> None:
     """If a DM for this comment is still queued, cancel it."""
-    async with aiosqlite.connect(_db_path) as db:
+    async with pool.acquire() as db:
         await db.execute(
             """
             UPDATE dm_sends
-            SET status = 'cancelled_deleted', updated_at = datetime('now')
-            WHERE comment_id = ? AND status = 'queued'
+            SET status = 'cancelled_deleted', updated_at = CURRENT_TIMESTAMP
+            WHERE comment_id = $1 AND status = 'queued'
             """,
-            (comment_id,),
+            comment_id,
         )
-        await db.commit()

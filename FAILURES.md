@@ -37,3 +37,12 @@ The `processed_events` and `dm_sends` tables grow indefinitely as new events arr
 
 **Condition:** Running continuously at high volume without manual or automated log rotation.
 **Impact:** Gradual degradation of throughput over months.
+
+---
+
+## 5. Memory Queue Overflow During Extreme Spikes
+
+The `event_queue` in `worker.py` is initialized with `maxsize=10_000`. If a sudden, extreme burst of traffic arrives (e.g., a massive viral event) and the background workers are rate-limited or backed up such that the queue reaches capacity, `event_queue.put_nowait()` will raise `asyncio.QueueFull`. The webhook endpoint currently catches this, logs an error, and returns a `200 OK`, silently dropping the webhook event. 
+
+**Condition:** Queue reaches capacity during a massive burst (>10,000 events before workers can drain).
+**Impact:** Comment events are silently lost, and no DM will be queued or sent for those events.

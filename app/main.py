@@ -54,6 +54,7 @@ async def lifespan(app: FastAPI):
         task.cancel()
     await asyncio.gather(*_background_tasks, return_exceptions=True)
     logger.info("Background workers stopped")
+    await db.close_db()
 
 
 # ─── FastAPI app ──────────────────────────────────────────────────────────────

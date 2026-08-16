@@ -125,20 +125,19 @@ async def _record_duplicate_blocked(rule_id: str, user_id: str, comment_id: str)
     dup row use a distinct composite key.
     """
     import uuid
-    import aiosqlite
-    from app.config import settings as cfg
+    from app import database as db
     dup_id = f"dup_{uuid.uuid4().hex[:12]}"
     # Use comment_id as part of the user_id key to allow multiple dup records per rule+user
     dup_user_key = f"{user_id}:dup:{comment_id}"
-    async with aiosqlite.connect(cfg.database_path) as conn:
+    async with db.pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT OR IGNORE INTO dm_sends (id, rule_id, user_id, comment_id, status)
-            VALUES (?, ?, ?, ?, 'duplicate_blocked')
+            INSERT INTO dm_sends (id, rule_id, user_id, comment_id, status)
+            VALUES ($1, $2, $3, $4, 'duplicate_blocked')
+            ON CONFLICT DO NOTHING
             """,
-            (dup_id, rule_id, dup_user_key, comment_id),
+            dup_id, rule_id, dup_user_key, comment_id,
         )
-        await conn.commit()
 
 
 async def _send_dm_with_tracking(
@@ -147,6 +146,7 @@ async def _send_dm_with_tracking(
     dm_message: str,
     comment_id: str,
     rule_id: str,
+    retry_count: int = 0,
 ) -> None:
     """
     Send a DM and update the tracking record.
@@ -163,7 +163,7 @@ async def _send_dm_with_tracking(
             recipient_user_id=user_id,
             message=dm_message,
             comment_id=comment_id,
-            idempotency_key=f"idem_{send_id}",
+            idempotency_key=f"idem_{send_id}_{retry_count}",
             max_attempts=settings.max_retries,
         )
 
@@ -244,6 +244,7 @@ async def reconciler_worker() -> None:
                                 dm_message=dm_message,
                                 comment_id=record["comment_id"],
                                 rule_id=record["rule_id"],
+                                retry_count=retries + 1,
                             )
                         )
                         logger.info(
