@@ -73,3 +73,20 @@ This application is fully containerized and automatically deployed to Render on 
 Interactive API documentation (Swagger UI) is available at `/docs` on the deployed URL, allowing you to test:
 - `POST /rules` - Create new keyword triggers
 - `GET /stats` - View real-time system metrics (sent, failed, queued, blocked)
+
+---
+
+## 🎯 Submission Details
+
+This project is submitted via `POST https://pseudogram-api.onrender.com/v1/submit` with the following payload:
+
+```json
+{
+  "email": "nikitha7865@gmail.com",
+  "github_repo": "https://github.com/NikithaKunapareddy/LinkPlease-Instagram-DM-Automation",
+  "working_url": "https://link-please-i3rq.onrender.com",
+  "loom_url": "YOUR_LOOM_URL_HERE",
+  "parts_completed": "A",
+  "start_date": "2026-08-10"
+}
+```
