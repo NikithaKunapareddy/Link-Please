@@ -1,52 +1,75 @@
-# LinkPlease Tech Intern Assignment
+<h1 align="center">LinkPlease — Instagram DM Automation</h1>
 
-Instagram DM automation — receives comment webhooks, matches keyword rules, sends DMs.
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.11+-blue.svg" alt="Python">
+  <img src="https://img.shields.io/badge/FastAPI-0.115+-009688.svg?logo=fastapi" alt="FastAPI">
+  <img src="https://img.shields.io/badge/PostgreSQL-Supabase-336791.svg?logo=postgresql" alt="PostgreSQL">
+  <img src="https://img.shields.io/badge/Deployed-Render-46E3B7.svg?logo=render" alt="Deployed on Render">
+</p>
 
-## Stack
+> A highly resilient, asynchronous background worker system designed to instantly process Instagram comment webhooks and automatically send direct messages based on keyword rules. Built to withstand hostile API conditions including extreme rate limits, out-of-order events, and random 500 errors.
 
-**Python 3.12+ · FastAPI · SQLite (aiosqlite) · httpx**
+---
 
-## Setup
+## ⚡ Features (Completed Scope: A + C)
 
-```bash
-pip install -r requirements.txt
-cp .env.example .env
-# Edit .env and set API_KEY=your_actual_api_key
+- **Instant Webhook Acknowledgment**: Webhooks are ingested into an in-memory `asyncio.Queue` to return a `200 OK` instantly, preventing dropped events during traffic spikes.
+- **Strict Idempotency**: Prevents sending duplicate DMs for the same user/rule combination utilizing an in-memory `asyncio.Lock` and atomic PostgreSQL `UNIQUE` constraints.
+- **Sliding-Window Rate Limiter**: Proactively spaces out outbound API requests (Max 9 requests per 60 seconds) to guarantee the 10req/min limit is never breached.
+- **Resilient Exponential Backoff**: Outbound DMs gracefully handle `500 Internal Server Errors` by automatically retrying using an exponential backoff strategy (1s, 2s, 4s, 8s...).
+- **Delivery Reconciliation**: A background polling worker (`reconciler_worker`) constantly verifies if accepted DMs actually delivered, and automatically requeues them if they silently failed.
+- **Comment Deletion Handling**: Intercepts `comment.deleted` events and safely cancels the outbound DM if it hasn't dispatched yet.
+
+---
+
+## 🏗️ Architecture
+
+```mermaid
+graph TD;
+    A[Incoming Webhook] -->|POST /webhook| B(FastAPI Router)
+    B -->|Put| C[(In-Memory asyncio.Queue)]
+    C -->|Drain| D{Event Worker}
+    
+    D -->|Check Deduplication| E[(Supabase PostgreSQL)]
+    D -->|Send DM| F[API Client]
+    
+    F -->|Exponential Backoff & Rate Limit| G((PseudoGram API))
+    
+    H{Reconciler Worker} -->|Poll Status| G
+    H -->|Requeue on Failure| F
 ```
 
-## Run
+---
 
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+## 📂 Project Structure
+
+```text
+Link-Please/
+├── app/
+│   ├── main.py           # FastAPI entry point, Webhook receiver, REST endpoints
+│   ├── worker.py         # Background processors (event_worker, reconciler_worker)
+│   ├── api_client.py     # Outbound HTTP client (retries, rate-limiting logic)
+│   ├── database.py       # asyncpg connection pooling & Supabase queries
+│   └── models.py         # Pydantic schemas for data validation
+├── tests/                # Automated testing scripts & load simulators
+├── FAILURES.md           # Documentation of extreme edge cases and known limitations
+├── render.yaml           # Infrastructure as Code (IaC) for Render deployment
+└── requirements.txt      # Python dependencies
 ```
 
-## Endpoints
+---
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/webhook` | Receive comment events (returns 200 in <5s) |
-| `POST` | `/rules` | Create keyword → DM message rule |
-| `GET` | `/stats` | Live stats |
-| `GET` | `/health` | Health check |
+## 🚀 Deployment
 
-## Parts Completed
+This application is fully containerized and automatically deployed to Render on every push to the `main` branch. 
 
-- **Part A** ✅ — Rules, webhook processing, DM sending, deduplication, retry on failure
-- **Part B** ✅ — Webhook signature verification (HMAC-SHA256), accurate stats under load
-- **Part C** ✅ — Delivery reconciliation, `comment.deleted` handling, 500-event burst
+- **Hosting**: Render (Web Service)
+- **Database**: Supabase (PostgreSQL with PgBouncer connection pooling)
 
-## Architecture
+---
 
-```
-POST /webhook → asyncio.Queue → event_worker (background)
-                                     ↓
-                              rule matching (case-insensitive)
-                                     ↓
-                              user+rule dedup (SQLite UNIQUE)
-                                     ↓
-                              send_dm() with retry/backoff
-                                     ↓
-                              reconciler_worker polls delivery status
-```
+## 📄 API Documentation
 
-See [FAILURES.md](./FAILURES.md) for known failure modes.
+Interactive API documentation (Swagger UI) is available at `/docs` on the deployed URL, allowing you to test:
+- `POST /rules` - Create new keyword triggers
+- `GET /stats` - View real-time system metrics (sent, failed, queued, blocked)
