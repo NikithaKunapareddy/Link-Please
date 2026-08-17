@@ -13,12 +13,12 @@ The `event_queue` is an `asyncio.Queue` held in memory. If the process restarts 
 
 ---
 
-## 2. Race condition in duplicate blocking under extreme concurrency
+## 2. Duplicate statistics can become inaccurate under extreme concurrency
 
-The user+rule dedup uses SQLite `INSERT OR IGNORE` on a `UNIQUE(rule_id, user_id)` constraint, which is atomic. However, the `duplicate_blocked` counter is tracked by inserting a *separate row* with a `dup_` prefix rule_id. If two events for the same user+rule arrive within ~1–2ms and both pass the first `INSERT OR IGNORE` check before either commits the `duplicate_blocked` row, both could increment the counter. The **actual DM** is still only sent once (the UNIQUE constraint prevents that), but the `duplicates_blocked` count could be off by one in this scenario.
+The user+rule deduplication is protected by a PostgreSQL `UNIQUE(rule_id, user_id)` constraint, so the actual DM should only be sent once. However, the duplicate-blocked statistics are recorded separately from the deduplication operation. Under extreme concurrent webhook delivery, the duplicate counter and the deduplication record are not updated as one atomic transaction, so the `duplicates_blocked` statistic could potentially become inaccurate.
 
-**Condition:** Same user+rule event arriving within ~1–2ms, extremely tight concurrency.
-**Frequency:** Rare during normal operation; possible under 500-event burst.
+**Condition:** Multiple duplicate events for the same user+rule arriving concurrently.
+**Impact:** The actual DM remains protected by the UNIQUE constraint, but `duplicates_blocked` could be inaccurate.
 
 ---
 
@@ -33,7 +33,7 @@ If a `comment.deleted` event arrives after the DM has already been dispatched to
 
 ## 4. Unbounded Database Growth and Cleanup
 
-The `processed_events` and `dm_sends` tables grow indefinitely as new events arrive. Since there is no cleanup mechanism to prune old completed records, the SQLite file size will eventually degrade database performance over millions of comments, potentially causing I/O bottlenecks and write locks during high concurrency.
+The `processed_events` and `dm_sends` tables grow indefinitely as new events arrive. Since there is no cleanup mechanism to prune old completed records, the PostgreSQL database size will eventually degrade database performance over millions of comments, potentially causing I/O bottlenecks and write locks during high concurrency.
 
 **Condition:** Running continuously at high volume without manual or automated log rotation.
 **Impact:** Gradual degradation of throughput over months.
