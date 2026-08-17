@@ -86,7 +86,7 @@ This project is submitted via `POST https://pseudogram-api.onrender.com/v1/submi
   "github_repo": "https://github.com/NikithaKunapareddy/LinkPlease-Instagram-DM-Automation",
   "working_url": "https://link-please-i3rq.onrender.com",
   "loom_url": "YOUR_LOOM_URL_HERE",
-  "parts_completed": "A",
+  "parts_completed": "A+C",
   "start_date": "2026-08-10"
 }
 ```
