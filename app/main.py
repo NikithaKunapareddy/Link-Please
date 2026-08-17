@@ -94,7 +94,59 @@ def _verify_signature(body: bytes, signature_header: str) -> bool:
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
-@app.post("/webhook", status_code=200)
+@app.post(
+    "/webhook",
+    status_code=200,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["event_id", "event_type", "data"],
+                        "properties": {
+                            "event_id": {"type": "string", "example": "evt_abc123"},
+                            "event_type": {
+                                "type": "string",
+                                "enum": ["comment.created", "comment.deleted"],
+                                "example": "comment.created",
+                            },
+                            "sent_at": {"type": "string", "example": "2026-01-01T00:00:00Z"},
+                            "data": {
+                                "type": "object",
+                                "properties": {
+                                    "comment_id": {"type": "string", "example": "cmt_001"},
+                                    "text": {"type": "string", "example": "What is the PRICE?"},
+                                    "from": {
+                                        "type": "object",
+                                        "properties": {
+                                            "user_id": {"type": "string", "example": "user_001"},
+                                            "username": {"type": "string", "example": "nikitha"},
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                        "example": {
+                            "event_id": "evt_abc123",
+                            "event_type": "comment.created",
+                            "sent_at": "2026-01-01T00:00:00Z",
+                            "data": {
+                                "comment_id": "cmt_001",
+                                "text": "What is the PRICE?",
+                                "from": {
+                                    "user_id": "user_001",
+                                    "username": "nikitha",
+                                },
+                            },
+                        },
+                    }
+                }
+            },
+        }
+    },
+)
 async def receive_webhook(request: Request) -> JSONResponse:
     """
     Receive comment events from the Pseudogram mock API.
@@ -108,6 +160,7 @@ async def receive_webhook(request: Request) -> JSONResponse:
     if settings.api_key and not _verify_signature(raw_body, sig_header):
         logger.warning("Webhook signature verification FAILED — rejecting request")
         raise HTTPException(status_code=401, detail="Invalid signature")
+
 
     # ── Parse JSON body ─────────────────────────────────────────────────────
     try:
